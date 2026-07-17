@@ -5,10 +5,11 @@ import json
 import time
 from datetime import datetime
 import io
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 import random
 import logging
 import os
+import qrcode
 from functools import wraps
 
 # --- 1. LOGGING SETUP ---
@@ -19,11 +20,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- 2. BOT SETUP ---
-BOT_TOKEN = "8551239286:AAEd8gIDuF3GkjA9hJgoSwI405_CrWoM6X4"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8551239286:AAEd8gIDuF3GkjA9hJgoSwI405_CrWoM6X4")
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- 3. FIREBASE SETUP (REST API - No key required!) ---
-FIREBASE_URL = "https://d3crown-805ce-default-rtdb.firebaseio.com/d3_clients/0rulvawKt1d6M3FlxfEariNOukk1/clients.json"
+# --- 3. FIREBASE SETUP ---
+FIREBASE_URL = os.getenv("FIREBASE_URL", "https://d3crown-805ce-default-rtdb.firebaseio.com/d3_clients/0rulvawKt1d6M3FlxfEariNOukk1/clients.json")
 
 # --- 4. OWNER INFORMATION ---
 OWNER_NAME = "Shahid Ali Abro"
@@ -47,9 +48,443 @@ def retry_on_failure(max_retries=3, delay=2):
         return wrapper
     return decorator
 
-# --- 6. MAIN FUNCTIONS ---
+# --- 6. PROFESSIONAL RECEIPT GENERATION (CANVA-QUALITY) ---
 
-@retry_on_failure(max_retries=3, delay=2)
+def generate_qr_code(data):
+    """Generate QR code for receipt verification"""
+    try:
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=3,
+            border=2,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="#1a237e", back_color="white")
+        
+        # Convert to PIL Image
+        qr_byte_arr = io.BytesIO()
+        qr_img.save(qr_byte_arr, format='PNG')
+        qr_byte_arr.seek(0)
+        return Image.open(qr_byte_arr)
+    except Exception as e:
+        logger.error(f"QR generation error: {e}")
+        return None
+
+def generate_professional_receipt(client_data, is_paid=False):
+    """Generate Canva-quality premium receipt with glassmorphism design"""
+    try:
+        # Canvas size
+        width = 1080
+        height = 1600
+        
+        # Create canvas
+        image = Image.new('RGB', (width, height), color='#f0f4f8')
+        draw = ImageDraw.Draw(image)
+        
+        # --- 1. BACKGROUND GRADIENT ---
+        # Create gradient background
+        for i in range(height):
+            ratio = i / height
+            r = int(240 - 60 * ratio)
+            g = int(244 - 70 * ratio)
+            b = int(248 - 80 * ratio)
+            draw.line([(0, i), (width, i)], fill=(r, g, b))
+        
+        # --- 2. TOP HEADER (Glassmorphism) ---
+        header_y = 20
+        header_height = 220
+        
+        # Glass effect - semi-transparent
+        glass_color = (26, 35, 126, 230)  # rgba
+        draw.rectangle(
+            [(30, header_y), (width - 30, header_y + header_height)],
+            fill=(26, 35, 126),
+            outline=(255, 255, 255, 50),
+            width=2
+        )
+        
+        # Inner glow
+        draw.rectangle(
+            [(40, header_y + 10), (width - 40, header_y + header_height - 10)],
+            fill=(40, 53, 147, 50),
+            outline=None
+        )
+        
+        # --- 3. COMPANY LOGO (Text-based) ---
+        try:
+            font_logo = ImageFont.truetype("arial.ttf", 52)
+            font_sub = ImageFont.truetype("arial.ttf", 24)
+            font_bold = ImageFont.truetype("arialbd.ttf", 36)
+            font_normal = ImageFont.truetype("arial.ttf", 20)
+            font_small = ImageFont.truetype("arial.ttf", 16)
+        except:
+            font_logo = ImageFont.load_default()
+            font_sub = ImageFont.load_default()
+            font_bold = ImageFont.load_default()
+            font_normal = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+        
+        # Company Name with shadow
+        shadow_offset = 3
+        draw.text(
+            (width//2 - 130 + shadow_offset, header_y + 40 + shadow_offset),
+            "D3 CROWN",
+            fill=(0, 0, 0, 100),
+            font=font_logo
+        )
+        draw.text(
+            (width//2 - 130, header_y + 40),
+            "D3 CROWN",
+            fill='#ffffff',
+            font=font_logo
+        )
+        
+        # Subtitle
+        draw.text(
+            (width//2 - 110, header_y + 100),
+            "FLASH FIBER ISP",
+            fill='#e0e0e0',
+            font=font_sub
+        )
+        draw.text(
+            (width//2 - 95, header_y + 130),
+            "Private Limited ™",
+            fill='#ffd700',
+            font=font_small
+        )
+        
+        # --- 4. STATUS BADGE (Premium Pill Shape) ---
+        status_text = "PAID ✓" if is_paid else "UNPAID ✗"
+        status_color = "#2e7d32" if is_paid else "#c62828"
+        badge_width = 180
+        badge_height = 50
+        badge_x = width//2 - badge_width//2
+        badge_y = header_y + header_height - 60
+        
+        # Badge background
+        draw.rectangle(
+            [(badge_x, badge_y), (badge_x + badge_width, badge_y + badge_height)],
+            fill=status_color,
+            outline='#ffffff',
+            width=2
+        )
+        # Badge text
+        draw.text(
+            (width//2 - 70, badge_y + 12),
+            status_text,
+            fill='#ffffff',
+            font=font_bold
+        )
+        
+        # --- 5. RECEIPT CONTENT (Glassmorphism Card) ---
+        card_y = header_y + header_height + 30
+        card_height = height - card_y - 40
+        
+        # Card background (glass effect)
+        draw.rectangle(
+            [(30, card_y), (width - 30, card_y + card_height)],
+            fill=(255, 255, 255, 240),
+            outline=(255, 255, 255, 100),
+            width=2
+        )
+        
+        # Card inner shadow
+        draw.rectangle(
+            [(40, card_y + 10), (width - 40, card_y + card_height - 10)],
+            fill=(240, 248, 255, 50)
+        )
+        
+        # --- 6. RECEIPT HEADER ---
+        y = card_y + 30
+        
+        # Receipt ID
+        receipt_id = f"D3-{datetime.now().strftime('%y%m%d')}-{random.randint(100000, 999999)}"
+        draw.text(
+            (60, y),
+            "RECEIPT #",
+            fill='#666',
+            font=font_small
+        )
+        draw.text(
+            (200, y),
+            receipt_id,
+            fill='#1a237e',
+            font=font_bold
+        )
+        
+        # Date
+        draw.text(
+            (60, y + 35),
+            "DATE & TIME",
+            fill='#666',
+            font=font_small
+        )
+        draw.text(
+            (200, y + 35),
+            datetime.now().strftime('%d %B %Y %I:%M %p'),
+            fill='#1a237e',
+            font=font_normal
+        )
+        
+        y += 80
+        
+        # --- 7. DIVIDER ---
+        draw.line([(60, y), (width - 60, y)], fill='#e0e0e0', width=2)
+        y += 20
+        
+        # --- 8. CUSTOMER INFORMATION (Rounded Box) ---
+        box_y = y
+        box_height = 180
+        draw.rectangle(
+            [(60, box_y), (width - 60, box_y + box_height)],
+            fill='#f8f9fa',
+            outline='#e0e0e0',
+            width=1
+        )
+        
+        draw.text(
+            (80, box_y + 15),
+            "👤 CUSTOMER INFORMATION",
+            fill='#1a237e',
+            font=font_bold
+        )
+        
+        customer_fields = [
+            ("Name", client_data.get('name', 'N/A')),
+            ("Phone", client_data.get('phone', 'N/A')),
+            ("Address", client_data.get('address', 'N/A')),
+            ("VLAN ID", client_data.get('vlanId', 'N/A'))
+        ]
+        
+        y = box_y + 50
+        for label, value in customer_fields:
+            draw.text(
+                (80, y),
+                label + ":",
+                fill='#666',
+                font=font_normal
+            )
+            draw.text(
+                (220, y),
+                value,
+                fill='#1a237e',
+                font=font_normal
+            )
+            y += 35
+        
+        y = box_y + box_height + 20
+        
+        # --- 9. PACKAGE DETAILS ---
+        draw.rectangle(
+            [(60, y), (width - 60, y + 140)],
+            fill='#f8f9fa',
+            outline='#e0e0e0',
+            width=1
+        )
+        
+        draw.text(
+            (80, y + 15),
+            "📦 PACKAGE DETAILS",
+            fill='#1a237e',
+            font=font_bold
+        )
+        
+        package_fields = [
+            ("Package", client_data.get('package', 'N/A')),
+            ("Speed", client_data.get('package', 'N/A').replace('DHCP-', '')),
+            ("Monthly Fee", f"Rs. {client_data.get('packageAmount', 0):,}"),
+            ("Start Date", client_data.get('packageStartDate', 'N/A'))
+        ]
+        
+        y = y + 50
+        for label, value in package_fields:
+            draw.text(
+                (80, y),
+                label + ":",
+                fill='#666',
+                font=font_normal
+            )
+            draw.text(
+                (220, y),
+                value,
+                fill='#1a237e',
+                font=font_normal
+            )
+            y += 30
+        
+        y = y + 20
+        
+        # --- 10. BILLING SUMMARY (Gradient Box) ---
+        amount = client_data.get('packageAmount', 0)
+        old_bill = client_data.get('oldBill', 0)
+        total_bill = amount + old_bill
+        paid_amount = 0
+        
+        payment_history = client_data.get('paymentHistory', [])
+        if payment_history and len(payment_history) > 0:
+            for entry in payment_history:
+                paid_amount += entry.get('credit', 0)
+        
+        remaining = total_bill - paid_amount
+        
+        # Billing box with gradient
+        billing_y = y
+        billing_height = 200
+        draw.rectangle(
+            [(60, billing_y), (width - 60, billing_y + billing_height)],
+            fill='#1a237e',
+            outline='#1a237e',
+            width=1
+        )
+        
+        draw.text(
+            (80, billing_y + 15),
+            "💰 BILLING SUMMARY",
+            fill='#ffffff',
+            font=font_bold
+        )
+        
+        billing_fields = [
+            ("Previous Balance", f"Rs. {old_bill:,}"),
+            ("Current Bill", f"Rs. {amount:,}"),
+            ("Total Bill", f"Rs. {total_bill:,}"),
+            ("Total Paid", f"Rs. {paid_amount:,}"),
+            ("Remaining Balance", f"Rs. {remaining:,}")
+        ]
+        
+        y = billing_y + 50
+        for label, value in billing_fields:
+            draw.text(
+                (80, y),
+                label + ":",
+                fill='#e0e0e0',
+                font=font_normal
+            )
+            
+            # Highlight colors for important fields
+            if label == "Remaining Balance" and remaining > 0:
+                text_color = '#ff6b6b'
+            elif label == "Total Paid" and paid_amount > 0:
+                text_color = '#69db7c'
+            else:
+                text_color = '#ffffff'
+            
+            draw.text(
+                (250, y),
+                value,
+                fill=text_color,
+                font=font_bold if label in ["Total Paid", "Remaining Balance"] else font_normal
+            )
+            y += 30
+        
+        y = billing_y + billing_height + 20
+        
+        # --- 11. TOTAL PAID SECTION ---
+        draw.rectangle(
+            [(60, y), (width - 60, y + 60)],
+            fill='#2e7d32' if paid_amount > 0 else '#c62828',
+            outline=None,
+            width=0
+        )
+        
+        draw.text(
+            (80, y + 15),
+            "TOTAL PAID",
+            fill='#ffffff',
+            font=font_bold
+        )
+        draw.text(
+            (250, y + 15),
+            f"Rs. {paid_amount:,}" if paid_amount > 0 else "Rs. 0",
+            fill='#ffffff',
+            font=font_bold
+        )
+        
+        if paid_amount == 0:
+            draw.text(
+                (80, y + 40),
+                "No payment recorded yet.",
+                fill='#ffcdd2',
+                font=font_small
+            )
+        
+        y = y + 80
+        
+        # --- 12. QR CODE FOR VERIFICATION ---
+        qr_data = f"D3CROWN|{receipt_id}|{client_data.get('phone', 'N/A')}|{datetime.now().strftime('%Y%m%d')}"
+        qr_img = generate_qr_code(qr_data)
+        
+        if qr_img:
+            qr_size = 120
+            qr_img = qr_img.resize((qr_size, qr_size))
+            image.paste(qr_img, (width - 180, y))
+            
+            draw.text(
+                (width - 210, y + qr_size + 10),
+                "Scan to Verify",
+                fill='#666',
+                font=font_small
+            )
+        
+        # --- 13. FOOTER ---
+        y = height - 120
+        
+        # Divider
+        draw.line([(60, y), (width - 60, y)], fill='#e0e0e0', width=2)
+        y += 20
+        
+        draw.text(
+            (width//2 - 120, y),
+            "Speed Ka Naya Andaaz!",
+            fill='#1a237e',
+            font=font_bold
+        )
+        
+        y += 40
+        draw.text(
+            (width//2 - 140, y),
+            f"📞 {OWNER_PHONE} | 📧 {OWNER_EMAIL}",
+            fill='#666',
+            font=font_small
+        )
+        y += 25
+        draw.text(
+            (width//2 - 130, y),
+            "D3 Crown Fiber — Connecting You to Excellence",
+            fill='#666',
+            font=font_small
+        )
+        y += 25
+        draw.text(
+            (width//2 - 80, y),
+            "- System Generated Receipt -",
+            fill='#999',
+            font=font_small
+        )
+        
+        # --- 14. WATERMARK ---
+        draw.text(
+            (width//2 - 200, height//2),
+            "D3 CROWN",
+            fill=(200, 200, 200, 30),
+            font=font_logo
+        )
+        
+        # --- 15. SAVE IMAGE ---
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='JPEG', quality=95)
+        img_byte_arr.seek(0)
+        
+        return img_byte_arr, receipt_id
+        
+    except Exception as e:
+        logger.error(f"Error generating premium receipt: {e}")
+        return None, None
+
+# --- 7. REST OF THE CODE (Same as before) ---
+
 def find_client_by_phone(phone_number):
     """Search for client by phone number"""
     try:
@@ -85,172 +520,6 @@ def find_client_by_phone(phone_number):
         
     except Exception as e:
         logger.error(f"Error in find_client: {e}")
-        return None, None
-
-def generate_professional_receipt(client_data, is_paid=False):
-    """Generate receipt image"""
-    try:
-        width = 1000
-        height = 1400
-        image = Image.new('RGB', (width, height), color='white')
-        draw = ImageDraw.Draw(image)
-        
-        primary_color = "#1a237e"
-        accent_color = "#e53935"
-        paid_color = "#2e7d32"
-        header_color = paid_color if is_paid else accent_color
-        
-        # Header
-        draw.rectangle([(0, 0), (width, 180)], fill=primary_color)
-        draw.rectangle([(0, 175), (width, 180)], fill=header_color)
-        
-        try:
-            font_large = ImageFont.truetype("arial.ttf", 44)
-            font_medium = ImageFont.truetype("arial.ttf", 28)
-            font_normal = ImageFont.truetype("arial.ttf", 20)
-            font_small = ImageFont.truetype("arial.ttf", 16)
-            font_bold = ImageFont.truetype("arialbd.ttf", 22)
-        except:
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-            font_normal = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-            font_bold = ImageFont.load_default()
-        
-        # Company Name
-        draw.text((width//2 - 150, 30), "D3 CROWN FIBER", fill='white', font=font_large)
-        draw.text((width//2 - 120, 80), "PREMIUM INTERNET SERVICES", fill='#e0e0e0', font=font_medium)
-        draw.text((width//2 - 130, 115), f"{OWNER_NAME} – {OWNER_PHONE}", fill='#ffd700', font=font_small)
-        
-        # Status Badge
-        status_text = "PAID ✓" if is_paid else "UNPAID ✗"
-        status_color = paid_color if is_paid else accent_color
-        draw.rectangle([(width//2 - 60, 145), (width//2 + 60, 170)], fill=status_color)
-        draw.text((width//2 - 45, 148), status_text, fill='white', font=font_small)
-        
-        # Receipt Info
-        y = 200
-        receipt_id = f"D3-{datetime.now().strftime('%y%m%d')}-{random.randint(100000, 999999)}"
-        draw.text((50, y), "Receipt #", fill='#666', font=font_small)
-        draw.text((180, y), receipt_id, fill=primary_color, font=font_normal)
-        
-        draw.text((50, y+30), "Date & Time", fill='#666', font=font_small)
-        draw.text((180, y+30), datetime.now().strftime('%d %B %Y %I:%M %p'), fill=primary_color, font=font_normal)
-        
-        y += 80
-        draw.line([(50, y), (width-50, y)], fill='#ddd', width=2)
-        
-        # Customer Details
-        y += 30
-        draw.text((50, y), "Customer Details", fill=primary_color, font=font_bold)
-        y += 30
-        
-        customer_fields = [
-            ("Customer", client_data.get('name', 'N/A')),
-            ("Phone", client_data.get('phone', 'N/A')),
-            ("Address", client_data.get('address', 'N/A')),
-            ("VLAN ID", client_data.get('vlanId', 'N/A')),
-            ("Username", client_data.get('username', 'N/A'))
-        ]
-        
-        for label, value in customer_fields:
-            draw.text((70, y), label + ":", fill='#555', font=font_normal)
-            draw.text((200, y), value, fill='#000', font=font_normal)
-            y += 30
-        
-        draw.line([(50, y), (width-50, y)], fill='#ddd', width=2)
-        
-        # Package Details
-        y += 30
-        draw.text((50, y), "Package Details", fill=primary_color, font=font_bold)
-        y += 30
-        
-        package_fields = [
-            ("Package", client_data.get('package', 'N/A')),
-            ("Speed", client_data.get('package', 'N/A').replace('DHCP-', '')),
-            ("Monthly Fee", f"Rs. {client_data.get('packageAmount', 0):,}"),
-            ("Start Date", client_data.get('packageStartDate', 'N/A')),
-            ("Expiry Date", client_data.get('packageStartDate', 'N/A'))
-        ]
-        
-        for label, value in package_fields:
-            draw.text((70, y), label + ":", fill='#555', font=font_normal)
-            draw.text((200, y), value, fill='#000', font=font_normal)
-            y += 30
-        
-        draw.line([(50, y), (width-50, y)], fill='#ddd', width=2)
-        
-        # Billing Summary
-        y += 30
-        draw.text((50, y), "Billing Summary", fill=primary_color, font=font_bold)
-        y += 30
-        
-        amount = client_data.get('packageAmount', 0)
-        old_bill = client_data.get('oldBill', 0)
-        total_bill = amount + old_bill
-        paid_amount = 0
-        
-        payment_history = client_data.get('paymentHistory', [])
-        if payment_history and len(payment_history) > 0:
-            for entry in payment_history:
-                paid_amount += entry.get('credit', 0)
-        
-        remaining = total_bill - paid_amount
-        
-        billing_fields = [
-            ("Previous Balance", f"Rs. {old_bill:,}", old_bill > 0),
-            ("Current Bill", f"Rs. {amount:,}", True),
-            ("Total Bill", f"Rs. {total_bill:,}", True),
-            ("Total Paid", f"Rs. {paid_amount:,}", paid_amount > 0),
-            ("Remaining Balance", f"Rs. {remaining:,}", remaining > 0)
-        ]
-        
-        for label, value, highlight in billing_fields:
-            draw.text((70, y), label + ":", fill='#555', font=font_normal)
-            if label == "Remaining Balance" and remaining > 0:
-                draw.text((250, y), value, fill=accent_color, font=font_normal)
-            elif label == "Total Paid" and paid_amount > 0:
-                draw.text((250, y), value, fill=paid_color, font=font_normal)
-            else:
-                draw.text((250, y), value, fill='#000', font=font_normal)
-            y += 30
-        
-        draw.line([(50, y), (width-50, y)], fill='#ddd', width=2)
-        
-        # Total Paid
-        y += 30
-        draw.text((50, y), "TOTAL PAID", fill=primary_color, font=font_bold)
-        if paid_amount > 0:
-            draw.text((250, y), f"Rs. {paid_amount:,}", fill=paid_color, font=font_bold)
-        else:
-            draw.text((250, y), "Rs. 0", fill=accent_color, font=font_bold)
-        
-        y += 35
-        if paid_amount == 0:
-            draw.text((50, y), "No payment recorded yet.", fill='#666', font=font_small)
-        
-        y += 40
-        draw.line([(50, y), (width-50, y)], fill='#ddd', width=2)
-        
-        # Footer
-        y += 30
-        draw.text((width//2 - 100, y), "Speed Ka Naya Andaaz!", fill=primary_color, font=font_medium)
-        
-        y += 40
-        draw.text((width//2 - 150, y), f"📞 {OWNER_PHONE} | 📧 {OWNER_EMAIL}", fill='#555', font=font_small)
-        y += 25
-        draw.text((width//2 - 130, y), "D3 Crown Fiber — Connecting You to Excellence", fill='#555', font=font_small)
-        y += 25
-        draw.text((width//2 - 80, y), "- System Generated Receipt -", fill='#999', font=font_small)
-        
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='JPEG', quality=95)
-        img_byte_arr.seek(0)
-        
-        return img_byte_arr, receipt_id
-        
-    except Exception as e:
-        logger.error(f"Error generating receipt: {e}")
         return None, None
 
 def format_payment_history(payment_history, limit=5):
@@ -306,7 +575,7 @@ def share_result_text(client_data, matched_phone):
         f"💻 _System by: Khalid Ali Pechuha_"
     )
 
-# --- 7. MAIN MENU ---
+# --- 8. MAIN MENU ---
 def get_main_menu():
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = KeyboardButton("📱 Check Account")
@@ -318,8 +587,7 @@ def get_main_menu():
     markup.add(btn4, btn5)
     return markup
 
-# --- 8. BOT HANDLERS ---
-
+# --- 9. BOT HANDLERS (Same as before) ---
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
@@ -511,7 +779,7 @@ def verify_client(message):
         
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
-            InlineKeyboardButton("🧾 Download Receipt", callback_data=f"receipt_{matched_phone}"),
+            InlineKeyboardButton("🧾 Download Premium Receipt", callback_data=f"receipt_{matched_phone}"),
             InlineKeyboardButton("📊 Payment History", callback_data=f"history_{matched_phone}")
         )
         keyboard.add(
@@ -543,14 +811,14 @@ def verify_client(message):
             reply_markup=get_main_menu()
         )
 
-# --- 9. CALLBACK HANDLERS ---
+# --- 10. CALLBACK HANDLERS ---
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     try:
         if call.data.startswith("receipt_"):
             phone = call.data.replace("receipt_", "")
-            bot.answer_callback_query(call.id, "🧾 Generating receipt...")
+            bot.answer_callback_query(call.id, "🧾 Generating premium receipt...")
             
             client_data, _ = find_client_by_phone(phone)
             if client_data:
@@ -560,11 +828,12 @@ def handle_callbacks(call):
                 
                 img_bytes, receipt_id = generate_professional_receipt(client_data, is_paid)
                 if img_bytes:
-                    caption = f"🧾 **Receipt #{receipt_id}**\n"
+                    caption = f"🧾 **Premium Receipt #{receipt_id}**\n"
                     caption += f"👤 {client_data.get('name', 'N/A')}\n"
                     caption += f"📞 {client_data.get('phone', 'N/A')}\n"
                     caption += f"📊 Status: {'✅ PAID' if is_paid else '❌ UNPAID'}\n"
                     caption += "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    caption += "✨ _Canva-Quality Design with QR Verification_\n"
                     caption += "💻 _System by: Khalid Ali Pechuha_"
                     
                     bot.send_photo(
@@ -574,7 +843,7 @@ def handle_callbacks(call):
                         parse_mode="Markdown"
                     )
                 else:
-                    bot.send_message(call.message.chat.id, "❌ Error generating receipt.")
+                    bot.send_message(call.message.chat.id, "❌ Error generating premium receipt.")
             else:
                 bot.send_message(call.message.chat.id, "❌ Client data not found.")
         
@@ -708,7 +977,7 @@ def handle_callbacks(call):
         logger.error(f"Error in callback: {e}")
         bot.answer_callback_query(call.id, "⚠️ Error processing request")
 
-# --- 10. RUN BOT ---
+# --- 11. RUN BOT ---
 if __name__ == "__main__":
     logger.info("🏢 D3 CROWN ISP Bot Starting...")
     logger.info(f"👨‍💼 Owner: {OWNER_NAME}")
