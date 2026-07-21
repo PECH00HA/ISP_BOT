@@ -3,13 +3,14 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 import requests
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 from PIL import Image, ImageDraw, ImageFont
 import random
 import logging
 import os
 from functools import wraps
+import calendar
 
 # --- 1. LOGGING SETUP ---
 logging.basicConfig(
@@ -47,7 +48,198 @@ def retry_on_failure(max_retries=3, delay=2):
         return wrapper
     return decorator
 
-# --- 6. PROFESSIONAL RECEIPT GENERATION (NO QR) ---
+# --- 6. BILLING REPAIR ENGINE ---
+def parse_date(date_str):
+    """Parse date string to datetime object. Supports multiple formats."""
+    if not date_str:
+        return None
+    formats = [
+        "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%Y/%m/%d",
+        "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except:
+            continue
+    return None
+
+def compute_month_diff(start_date, end_date):
+    """Compute whole months between two dates (start inclusive, end exclusive)."""
+    if not start_date or not end_date:
+        return 0
+    # If start date is after end date, no months
+    if start_date > end_date:
+        return 0
+    # Count full months
+    months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+    # If day of month in end_date is before day in start_date, we haven't completed that month
+    if end_date.day < start_date.day:
+        months -= 1
+    return max(0, months)
+
+def billing_repair_engine(client_data, phone):
+    """
+    Recalculate billing from scratch using:
+    - paymentHistory (list of entries with 'credit', 'debit', 'date')
+    - packageAmount (monthly fee)
+    - packageStartDate (when billing started)
+    - current date
+
+    Updates:
+    - oldBill (remaining balance)
+    - status ('PAID' / 'UNPAID')
+    - totalPaid (sum of credits)
+    - totalBill (packageAmount * months elapsed)
+    - remainingBalance
+    - lastPaymentDate (if any)
+    - nextDueDate (if unpaid, approximate next month's due)
+
+    Also repairs missing fields.
+    """
+    if not client_data:
+        return None
+
+    # Ensure all required fields exist with defaults
+    client_data.setdefault('paymentHistory', [])
+    client_data.setdefault('packageAmount', 0)
+    client_data.setdefault('packageStartDate', None)
+    client_data.setdefault('status', 'UNPAID')
+    client_data.setdefault('oldBill', 0)
+
+    # If packageAmount is 0, treat as missing - try to infer from package name?
+    # For now, if 0, we assume no billing yet
+    package_amount = client_data.get('packageAmount', 0)
+    if package_amount <= 0:
+        # Could try to infer from package string, but for simplicity we set to 0 and mark as PAID
+        client_data['oldBill'] = 0
+        client_data['status'] = 'PAID'
+        client_data['totalPaid'] = 0
+        client_data['remainingBalance'] = 0
+        client_data['totalBill'] = 0
+        return client_data
+
+    # Parse start date
+    start_str = client_data.get('packageStartDate')
+    start_date = parse_date(start_str)
+    if not start_date:
+        # If no start date, assume today (or default to 1 month ago?)
+        logger.warning(f"No valid start date for client {phone}, assuming today")
+        start_date = datetime.now()
+        client_data['packageStartDate'] = start_date.strftime("%Y-%m-%d")
+
+    # Compute months elapsed
+    today = datetime.now()
+    months_elapsed = compute_month_diff(start_date, today)
+    if months_elapsed < 0:
+        months_elapsed = 0
+
+    total_bill = package_amount * months_elapsed
+
+    # Sum credits from paymentHistory
+    total_paid = 0
+    last_payment_date = None
+    for entry in client_data.get('paymentHistory', []):
+        credit = entry.get('credit', 0)
+        if credit > 0:
+            total_paid += credit
+            # update last payment date
+            entry_date = entry.get('date')
+            if entry_date:
+                dt = parse_date(entry_date)
+                if dt and (not last_payment_date or dt > last_payment_date):
+                    last_payment_date = dt
+
+    remaining = total_bill - total_paid
+    if remaining < 0:
+        remaining = 0  # Overpaid? We'll treat as 0, but could store credit
+
+    # Determine status
+    if remaining <= 0:
+        status = "PAID"
+    else:
+        status = "UNPAID"
+
+    # Compute next due date (approximately 1 month from last payment or start)
+    if status == "UNPAID":
+        if last_payment_date:
+            next_due = last_payment_date + timedelta(days=30)  # approximate
+        else:
+            next_due = start_date + timedelta(days=30 * (months_elapsed + 1))
+        client_data['nextDueDate'] = next_due.strftime("%Y-%m-%d")
+    else:
+        client_data['nextDueDate'] = "N/A"
+
+    # Update client_data with computed values
+    client_data['oldBill'] = remaining
+    client_data['status'] = status
+    client_data['totalPaid'] = total_paid
+    client_data['remainingBalance'] = remaining
+    client_data['totalBill'] = total_bill
+    if last_payment_date:
+        client_data['lastPaymentDate'] = last_payment_date.strftime("%Y-%m-%d")
+    else:
+        client_data['lastPaymentDate'] = "N/A"
+
+    # For receipt: we also store isPaid flag
+    client_data['isPaid'] = (status == "PAID")
+
+    # Auto-repair: ensure paymentHistory is a list
+    if not isinstance(client_data.get('paymentHistory'), list):
+        client_data['paymentHistory'] = []
+
+    return client_data
+
+def sync_client_to_firebase(phone, client_data):
+    """Update Firebase with the repaired client data."""
+    try:
+        # We need to update the specific client entry. Since we don't have unique ID, we fetch all and update.
+        response = requests.get(FIREBASE_URL, timeout=15)
+        if response.status_code != 200:
+            logger.error(f"Firebase fetch error: {response.status_code}")
+            return False
+        clients = response.json()
+        if not clients or not isinstance(clients, list):
+            return False
+
+        # Find index of client with matching phone
+        clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '').strip()
+        for idx, cl in enumerate(clients):
+            if not isinstance(cl, dict):
+                continue
+            client_phone = str(cl.get('phone', '')).replace('+', '').replace('-', '').replace(' ', '').strip()
+            if client_phone == clean_phone:
+                # Update this client entry
+                # Keep original fields, but update computed ones
+                # But we should not override non-billing fields, only billing related.
+                # We'll update: oldBill, status, totalPaid, remainingBalance, totalBill, lastPaymentDate, nextDueDate
+                # Also ensure paymentHistory is preserved (it's already in client_data)
+                clients[idx]['oldBill'] = client_data.get('oldBill', 0)
+                clients[idx]['status'] = client_data.get('status', 'UNPAID')
+                clients[idx]['totalPaid'] = client_data.get('totalPaid', 0)
+                clients[idx]['remainingBalance'] = client_data.get('remainingBalance', 0)
+                clients[idx]['totalBill'] = client_data.get('totalBill', 0)
+                clients[idx]['lastPaymentDate'] = client_data.get('lastPaymentDate', 'N/A')
+                clients[idx]['nextDueDate'] = client_data.get('nextDueDate', 'N/A')
+                # Ensure paymentHistory is list
+                clients[idx]['paymentHistory'] = client_data.get('paymentHistory', [])
+                # Also update packageStartDate if corrected
+                clients[idx]['packageStartDate'] = client_data.get('packageStartDate')
+                break
+
+        # Put back to Firebase
+        response = requests.put(FIREBASE_URL, json=clients, timeout=15)
+        if response.status_code in (200, 201):
+            logger.info(f"Firebase sync successful for {phone}")
+            return True
+        else:
+            logger.error(f"Firebase update failed: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"Error syncing to Firebase: {e}")
+        return False
+
+# --- 7. PROFESSIONAL RECEIPT GENERATION (NO QR) ---
 def generate_professional_receipt(client_data, is_paid=False):
     """Generate Canva-quality premium receipt without QR code"""
     try:
@@ -212,18 +404,12 @@ def generate_professional_receipt(client_data, is_paid=False):
         
         y = y + 20
         
-        # --- Billing Summary ---
+        # --- Billing Summary (using repaired data) ---
         amount = client_data.get('packageAmount', 0)
-        old_bill = client_data.get('oldBill', 0)
-        total_bill = amount + old_bill
-        paid_amount = 0
-        
-        payment_history = client_data.get('paymentHistory', [])
-        if payment_history and len(payment_history) > 0:
-            for entry in payment_history:
-                paid_amount += entry.get('credit', 0)
-        
-        remaining = total_bill - paid_amount
+        old_bill = client_data.get('oldBill', 0)          # remaining balance
+        total_bill = client_data.get('totalBill', 0)
+        total_paid = client_data.get('totalPaid', 0)
+        remaining = client_data.get('remainingBalance', 0)
         
         billing_y = y
         billing_height = 200
@@ -236,34 +422,27 @@ def generate_professional_receipt(client_data, is_paid=False):
         draw.text((80, billing_y + 15), "💰 BILLING SUMMARY", fill='#ffffff', font=font_bold)
         
         billing_fields = [
-            ("Previous Balance", f"Rs. {old_bill:,}"),
-            ("Current Bill", f"Rs. {amount:,}"),
-            ("Total Bill", f"Rs. {total_bill:,}"),
-            ("Total Paid", f"Rs. {paid_amount:,}"),
-            ("Remaining Balance", f"Rs. {remaining:,}")
+            ("Total Bill (All Months)", f"Rs. {total_bill:,}"),
+            ("Total Paid", f"Rs. {total_paid:,}"),
+            ("Outstanding Balance", f"Rs. {remaining:,}")
         ]
         y = billing_y + 50
         for label, value in billing_fields:
             draw.text((80, y), label + ":", fill='#e0e0e0', font=font_normal)
-            if label == "Remaining Balance" and remaining > 0:
-                text_color = '#ff6b6b'
-            elif label == "Total Paid" and paid_amount > 0:
-                text_color = '#69db7c'
-            else:
-                text_color = '#ffffff'
-            draw.text((250, y), value, fill=text_color, font=font_bold if label in ["Total Paid", "Remaining Balance"] else font_normal)
+            text_color = '#ff6b6b' if label == "Outstanding Balance" and remaining > 0 else '#ffffff'
+            draw.text((250, y), value, fill=text_color, font=font_bold if label in ["Total Paid", "Outstanding Balance"] else font_normal)
             y += 30
         
         y = billing_y + billing_height + 20
         
-        # --- Total Paid ---
+        # --- Total Paid (or status) ---
         draw.rectangle(
             [(60, y), (width - 60, y + 60)],
-            fill='#2e7d32' if paid_amount > 0 else '#c62828'
+            fill='#2e7d32' if total_paid > 0 else '#c62828'
         )
         draw.text((80, y + 15), "TOTAL PAID", fill='#ffffff', font=font_bold)
-        draw.text((250, y + 15), f"Rs. {paid_amount:,}" if paid_amount > 0 else "Rs. 0", fill='#ffffff', font=font_bold)
-        if paid_amount == 0:
+        draw.text((250, y + 15), f"Rs. {total_paid:,}" if total_paid > 0 else "Rs. 0", fill='#ffffff', font=font_bold)
+        if total_paid == 0:
             draw.text((80, y + 40), "No payment recorded yet.", fill='#ffcdd2', font=font_small)
         
         y = y + 80
@@ -293,7 +472,7 @@ def generate_professional_receipt(client_data, is_paid=False):
         logger.error(f"Error generating premium receipt: {e}")
         return None, None
 
-# --- 7. FIND CLIENT FUNCTION ---
+# --- 8. FIND CLIENT FUNCTION (with repair) ---
 @retry_on_failure(max_retries=3, delay=2)
 def find_client_by_phone(phone_number):
     try:
@@ -306,22 +485,35 @@ def find_client_by_phone(phone_number):
         if not clients_data or not isinstance(clients_data, list):
             logger.error("Invalid client data format")
             return None, None
+
         for client in clients_data:
             if not isinstance(client, dict):
                 continue
             client_phone = client.get('phone', '')
             client_phone = str(client_phone).replace('+', '').replace('-', '').replace(' ', '').strip()
             if client_phone == clean_phone:
-                return client, client_phone
+                # Found client, now run billing repair
+                repaired_client = billing_repair_engine(client, clean_phone)
+                if repaired_client:
+                    # Sync repaired data back to Firebase
+                    sync_client_to_firebase(clean_phone, repaired_client)
+                    return repaired_client, client_phone
+                else:
+                    return client, client_phone
             if len(client_phone) >= 10 and len(clean_phone) >= 10:
                 if client_phone[-10:] == clean_phone[-10:]:
-                    return client, client_phone
+                    repaired_client = billing_repair_engine(client, clean_phone)
+                    if repaired_client:
+                        sync_client_to_firebase(clean_phone, repaired_client)
+                        return repaired_client, client_phone
+                    else:
+                        return client, client_phone
         return None, None
     except Exception as e:
         logger.error(f"Error in find_client: {e}")
         return None, None
 
-# --- 8. PAYMENT HISTORY & SHARE TEXT ---
+# --- 9. PAYMENT HISTORY & SHARE TEXT ---
 def format_payment_history(payment_history, limit=5):
     if not payment_history or len(payment_history) == 0:
         return "📊 No payment history available."
@@ -353,21 +545,27 @@ def share_result_text(client_data, matched_phone):
     status = client_data.get('status', 'active')
     address = client_data.get('address', 'N/A')
     vlan_id = client_data.get('vlanId', 'N/A')
+    old_bill = client_data.get('oldBill', 0)
+    total_bill = client_data.get('totalBill', 0)
+    total_paid = client_data.get('totalPaid', 0)
     return (
         f"🏢 *D3 CROWN FIBER - Account Details*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 *Name:* {name}\n"
         f"📞 *Phone:* {matched_phone}\n"
         f"📦 *Package:* {package}\n"
-        f"💰 *Amount:* Rs.{amount:,}\n"
+        f"💰 *Monthly Fee:* Rs.{amount:,}\n"
         f"📊 *Status:* {status.upper()}\n"
         f"📍 *Address:* {address}\n"
         f"🔢 *VLAN ID:* {vlan_id}\n"
+        f"💵 *Total Bill:* Rs.{total_bill:,}\n"
+        f"💳 *Total Paid:* Rs.{total_paid:,}\n"
+        f"⚠️ *Outstanding:* Rs.{old_bill:,}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💻 _System by: Khalid Ali Pechuha_"
     )
 
-# --- 9. MAIN MENU ---
+# --- 10. MAIN MENU ---
 def get_main_menu():
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = KeyboardButton("📱 Check Account")
@@ -379,7 +577,7 @@ def get_main_menu():
     markup.add(btn4, btn5)
     return markup
 
-# --- 10. BOT HANDLERS ---
+# --- 11. BOT HANDLERS ---
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
@@ -482,6 +680,7 @@ def verify_client(message):
             bot.send_message(message.chat.id, "❌ **Access Denied!**\n\nThis number is not registered in our system.\n\n" + f"👨‍💼 **Owner:** {OWNER_NAME}\n📞 **Contact:** {OWNER_PHONE}\n\n💻 _System by: Khalid Ali Pechuha_", parse_mode="Markdown", reply_markup=get_main_menu())
             return
         
+        # Use repaired data
         name = client_data.get('name', 'N/A')
         package = client_data.get('package', 'N/A')
         package_amount = client_data.get('packageAmount', 'N/A')
@@ -490,18 +689,12 @@ def verify_client(message):
         join_date = client_data.get('joinDate', 'N/A')
         vlan_id = client_data.get('vlanId', 'N/A')
         old_bill = client_data.get('oldBill', 0)
+        total_bill = client_data.get('totalBill', 0)
+        total_paid = client_data.get('totalPaid', 0)
+        last_payment_date = client_data.get('lastPaymentDate', 'N/A')
+        next_due = client_data.get('nextDueDate', 'N/A')
         
         package_display = f"{package} (Rs. {package_amount:,})" if package_amount != 'N/A' else package
-        
-        payment_history = client_data.get('paymentHistory', [])
-        last_payment = "N/A"
-        total_paid = 0
-        if payment_history and isinstance(payment_history, list) and len(payment_history) > 0:
-            last_entry = payment_history[-1]
-            last_payment = f"{last_entry.get('date', 'N/A')} - Rs.{last_entry.get('debit', 0):,}"
-            total_paid = sum(entry.get('credit', 0) for entry in payment_history)
-        
-        is_paid = total_paid > 0 or status.lower() == 'paid'
         
         response_msg = (
             "✅ **ACCOUNT VERIFIED**\n"
@@ -513,8 +706,11 @@ def verify_client(message):
             f"📍 **Address:** {address}\n"
             f"📅 **Join Date:** {join_date}\n"
             f"🔢 **VLAN ID:** {vlan_id}\n"
-            f"💰 **Old Bill:** Rs.{old_bill:,}\n"
-            f"💳 **Last Payment:** {last_payment}\n"
+            f"💰 **Total Bill (All Months):** Rs.{total_bill:,}\n"
+            f"💳 **Total Paid:** Rs.{total_paid:,}\n"
+            f"⚠️ **Outstanding Balance:** Rs.{old_bill:,}\n"
+            f"📆 **Last Payment:** {last_payment_date}\n"
+            f"📆 **Next Due:** {next_due}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👨‍💼 **Owner:** {OWNER_NAME}\n"
             f"📞 **Contact:** {OWNER_PHONE}\n"
@@ -544,7 +740,7 @@ def verify_client(message):
         bot.delete_message(message.chat.id, status_msg.message_id)
         bot.send_message(message.chat.id, f"⚠️ **Technical Error**\n\nSomething went wrong. Please try again later.\n\n👨‍💼 **Contact Owner:** {OWNER_PHONE}\n💻 _System by: Khalid Ali Pechuha_", reply_markup=get_main_menu())
 
-# --- 11. CALLBACK HANDLERS ---
+# --- 12. CALLBACK HANDLERS ---
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     try:
@@ -553,15 +749,14 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "🧾 Generating premium receipt...")
             client_data, _ = find_client_by_phone(phone)
             if client_data:
-                payment_history = client_data.get('paymentHistory', [])
-                total_paid = sum(entry.get('credit', 0) for entry in payment_history) if payment_history else 0
-                is_paid = total_paid > 0 or client_data.get('status', '').lower() == 'paid'
+                is_paid = client_data.get('status', '').upper() == "PAID"
                 img_bytes, receipt_id = generate_professional_receipt(client_data, is_paid)
                 if img_bytes:
                     caption = f"🧾 **Premium Receipt #{receipt_id}**\n"
                     caption += f"👤 {client_data.get('name', 'N/A')}\n"
                     caption += f"📞 {client_data.get('phone', 'N/A')}\n"
                     caption += f"📊 Status: {'✅ PAID' if is_paid else '❌ UNPAID'}\n"
+                    caption += f"💰 Outstanding: Rs.{client_data.get('oldBill', 0):,}\n"
                     caption += "━━━━━━━━━━━━━━━━━━━━━━\n"
                     caption += "✨ _Canva-Quality Design_\n"
                     caption += "💻 _System by: Khalid Ali Pechuha_"
@@ -661,7 +856,7 @@ def handle_callbacks(call):
         logger.error(f"Error in callback: {e}")
         bot.answer_callback_query(call.id, "⚠️ Error processing request")
 
-# --- 12. RUN BOT ---
+# --- 13. RUN BOT ---
 if __name__ == "__main__":
     logger.info("🏢 D3 CROWN ISP Bot Starting...")
     logger.info(f"👨‍💼 Owner: {OWNER_NAME}")
